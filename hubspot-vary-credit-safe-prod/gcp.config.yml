@@ -1,0 +1,6 @@
+gcp:
+  region: europe-west1
+  runtime: nodejs20
+  name: hubspotVaryCreditSafeProd
+  source: dist
+  project: internal-390409

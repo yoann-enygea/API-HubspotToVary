@@ -1,0 +1,9 @@
+.env.json
+**/node_modules
+/lib
+/dist
+.DS_Store
+.AppleDouble
+.LSOverride
+.env.yml
+package-lock.json

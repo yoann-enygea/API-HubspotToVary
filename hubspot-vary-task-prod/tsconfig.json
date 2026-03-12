@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "esModuleInterop": true,
+    "target": "es2018",
+    "lib": ["dom", "ES2018"],
+    "moduleResolution": "node",
+    "sourceMap": false,
+    "outDir": "dist",
+    "removeComments": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["*"]
+    },
+    "noUnusedLocals": true,
+    "incremental": false
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "./src/boilerplates"]
+}
