@@ -30,8 +30,12 @@ echo "Compiling the ts files"
 npx tsc
 cp package.json dist/package.json
 cp package-lock.json dist/package-lock.json
-sed -i '' '2s/\"main\": \"dist\/index.js\"/\"main\": \"index.js\"/g' dist/package.json
-
+node -e "
+const fs = require('fs');
+const p = JSON.parse(fs.readFileSync('dist/package.json', 'utf8'));
+p.main = 'src/index.js';
+fs.writeFileSync('dist/package.json', JSON.stringify(p, null, 2));
+"
 eval $(parse_yaml gcp.config.yml "CONF_")
 
 echo "Start of the gcp deployment" 

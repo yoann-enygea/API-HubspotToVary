@@ -372,7 +372,7 @@ functions.http(
         // pour Société Vary lookup
         "country","address_country","zip","postal_code","hs_postal_code","adresse_code_postal","pays",
         // pour Client (customer) lookup
-        "id_vary","code_client_vary"
+        "idclient_vary","id_vary","code_client_vary"
       ];
       const hsCompany = await fetchHubSpotCompany(idCompanyHS, wantedProps);
       const hsProps   = hsCompany?.properties ?? {};
@@ -394,15 +394,20 @@ functions.http(
         return res.status(502).json({ message: "Société Vary trouvée mais id illisible", varyCompany });
       }
 
-      // 5) Résoudre l'id du Client (customer) à partir de HS: id_vary (num) ou code_client_vary -> lookup
-      let idVaryCustomer = toNum(hsProps.id_vary ?? hsProps.id_vary?.value);
+      // 5) Résoudre l'id du Client (customer) à partir de HS: idclient_vary (num) ou code_client_vary -> lookup
+      let idVaryCustomer = toNum(
+        hsProps.idclient_vary ??
+        hsProps.idclient_vary?.value ??
+        hsProps.id_vary ??
+        hsProps.id_vary?.value
+      );
       if (!idVaryCustomer) {
         const code = (hsProps.code_client_vary ?? hsProps.code_client_vary?.value ?? "").toString().trim();
         if (code) idVaryCustomer = await getVaryCustomerIdByCode(token, code);
       }
       if (!idVaryCustomer) {
         return res.status(404).json({
-          message: "Client Vary introuvable: renseigner 'id_vary' (numérique) ou 'code_client_vary' sur la Company HubSpot.",
+          message: "Client Vary introuvable: renseigner 'idclient_vary' (numérique) ou 'code_client_vary' sur la Company HubSpot.",
           debug_hint: { hubspot_company_id: idCompanyHS }
         });
       }

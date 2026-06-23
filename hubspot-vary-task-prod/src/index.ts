@@ -24,7 +24,6 @@ const HUBSPOT_API_KEY = process.env.HUBSPOT_API_KEY || "";
 /** =============================
  * Types d'association Vary (swagger)
  * ============================== */
-const IDTYPE_VARY_COMPANY = 11; // Société Vary (région/agence interne)
 const IDTYPE_CUSTOMER = 3;  // Client
 const IDTYPE_CONTACT = 23; // Contact
 
@@ -582,6 +581,7 @@ functions.http(
         "adresse_code_postal",
         "pays",
         // pour Client (customer) lookup
+        "idclient_vary",
         "id_vary",
         "code_client_vary",
       ];
@@ -639,10 +639,13 @@ functions.http(
           .json({ message: "Société Vary trouvée mais id illisible", varyCompany });
       }
 
-      // 5) Résoudre l'id du Client (customer) à partir de HS: id_vary (num) ou code_client_vary -> lookup
+      // 5) Résoudre l'id du Client (customer) à partir de HS: idclient_vary (num) ou code_client_vary -> lookup
       console.log("STEP 5 - resolve Vary customer start");
       let idVaryCustomer = toNum(
-        hsProps.id_vary ?? hsProps.id_vary?.value
+        hsProps.idclient_vary ??
+        hsProps.idclient_vary?.value ??
+        hsProps.id_vary ??
+        hsProps.id_vary?.value
       );
       if (!idVaryCustomer) {
         const code = (
@@ -655,11 +658,10 @@ functions.http(
         if (code) idVaryCustomer = await getVaryCustomerIdByCode(token, code);
       }
       console.log("STEP 5 - resolved idVaryCustomer:", idVaryCustomer);
-
       if (!idVaryCustomer) {
         return res.status(404).json({
           message:
-            "Client Vary introuvable: renseigner 'id_vary' (numérique) ou 'code_client_vary' sur la Company HubSpot.",
+            "Client Vary introuvable: renseigner 'idclient_vary' (numérique) ou 'code_client_vary' sur la Company HubSpot.",
           debug_hint: { hubspot_company_id: idCompanyHS },
         });
       }
@@ -734,18 +736,12 @@ functions.http(
       console.log("STEP 7 - alreadyKnown:", alreadyKnown);
       console.log("STEP 7 - createdNow:", createdNow);
 
-      // 8) Choisir le contact principal (priorité à un déjà connu)
-      const primaryContactId =
-        alreadyKnown.find(Boolean) ?? varyContactIds[0] ?? undefined;
-      console.log("STEP 8 - primaryContactId:", primaryContactId);
-
-      // 9) Création de la tâche : uniquement le principal dans idContact
+      // 8) Création de la tâche sans contact, les associations se font ensuite
       const t = readTaskFromPayload(payload);
 
       const taskData: any = {
         idAction: t.idAction ?? 7,
         idCompany: idVaryCompany, // Société Vary (agence interne)
-        idContact: primaryContactId || undefined, // UNIQUEMENT le principal
         sNote: sNoteClean,
         idExternal: t.idExternal ?? idCompanyHS, // trace HS
       };
@@ -754,20 +750,8 @@ functions.http(
       const taskCreated = await createVaryTask(taskData, token);
       console.log("STEP 9 - createVaryTask done, idTask:", taskCreated?.idTask);
 
-      // 10) Lier Société Vary (11) + Client (3)
-      let assocVaryCompany: any = null;
+      // 10) Lier le Client (3)
       let assocCustomer: any = null;
-
-      try {
-        assocVaryCompany = await linkTask(
-          taskCreated.idTask,
-          IDTYPE_VARY_COMPANY, // 11
-          [idVaryCompany!],
-          token
-        );
-      } catch (e) {
-        console.warn("STEP 10 - Vary company link warn:", safeError(e));
-      }
 
       try {
         assocCustomer = await linkTask(
@@ -780,17 +764,14 @@ functions.http(
         console.warn("STEP 10 - Customer link warn:", safeError(e));
       }
 
-      // 11) Link des contacts secondaires (évite le doublon avec le principal)
-      const secondaryContactIds = varyContactIds.filter(
-        (id) => id !== primaryContactId
-      );
+      // 11) Link de tous les contacts après la création de la tâche
       let assocContacts: any = null;
-      if (secondaryContactIds.length) {
+      if (varyContactIds.length) {
         try {
           assocContacts = await linkTask(
             taskCreated.idTask,
             IDTYPE_CONTACT,
-            secondaryContactIds,
+            varyContactIds,
             token
           );
         } catch (e) {
@@ -817,11 +798,10 @@ functions.http(
       console.log("STEP 13 - sending 201 response");
       return res.status(200).json({
         message:
-          "Tâche Vary créée depuis la dernière note Company, liée à la Société Vary, au Client et aux Contacts",
+          "Tâche Vary créée depuis la dernière note Company, liée au Client et aux Contacts",
         vary_task: taskCreated,
         sent_payload: taskData,
         associations: {
-          vary_company: assocVaryCompany,
           customer: assocCustomer,
           contacts: assocContacts,
         },
@@ -835,7 +815,6 @@ functions.http(
           idCompanyHS,
           idVaryCompany,
           idVaryCustomer,
-          primaryContactId,
           varyContactIds,
           createdNow,
           alreadyKnown,

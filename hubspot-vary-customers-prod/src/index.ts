@@ -19,6 +19,7 @@ const VARY_USER = process.env.VARY_USER || "";
 const VARY_PASSWORD = process.env.VARY_PASSWORD || "";
 const HUBSPOT_API_KEY = process.env.HUBSPOT_API_KEY || "";
 const VARY_CONTACT_ID = Number(process.env.VARY_CONTACT_ID || "131058"); // idContact4Log
+const VARY_CREATE_CUSTOMER_CODE = "DEFAUTHUBSPOT";
 const HTTP_TIMEOUT_MS = Math.max(
   1000,
   Number(process.env.HTTP_TIMEOUT_MS || "10000")
@@ -71,6 +72,30 @@ const toInt = (v: any) => {
 
 const normalizePhone = (raw?: string): string | undefined =>
   raw ? raw.replace(/[^\d+]/g, "") : undefined;
+
+const normalizeOptionalText = (v: any): string | undefined => {
+  if (v == null) return undefined;
+  const s = v.toString().trim();
+  return s || undefined;
+};
+
+const hasParticulierMailingKeyValue = (v: any): boolean => {
+  if (v == null) return false;
+  if (typeof v === "number") return v === 0;
+  if (typeof v === "string") {
+    return v
+      .split(/[;,.\s]+/)
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .some((part) => part === "0");
+  }
+  if (Array.isArray(v)) return v.some((item) => hasParticulierMailingKeyValue(item));
+  if (typeof v === "object") {
+    if ("nKey" in v || "nValue" in v) return false;
+    return hasParticulierMailingKeyValue(v.value ?? v.internalValue ?? v.values);
+  }
+  return false;
+};
 
 const hsVal = (node: any, key: string): any => {
   if (!node) return undefined;
@@ -149,6 +174,44 @@ const parseMailingKeyObjects = (v: any): VaryMailingKey[] => {
   return [...acc.values()].sort((a, b) => a.nKey - b.nKey);
 };
 
+const extractActiveMailingKeys = (mailingKeys: VaryMailingKey[]): number[] =>
+  mailingKeys
+    .filter((mailingKey) => mailingKey.nValue !== 0)
+    .map((mailingKey) => mailingKey.nKey);
+
+const buildMailingKeysForVary = (
+  selectedMailingKeys: number[],
+  ...sources: any[]
+): VaryMailingKey[] => {
+  const selected = new Set(selectedMailingKeys);
+  const all = new Set(selectedMailingKeys);
+
+  for (const source of sources) {
+    const sourceMailingKeys = Array.isArray(source)
+      ? source
+      : source?.MailingKeys ??
+      source?.mailingKeys ??
+      hsVal(source, "MailingKeys");
+
+    for (const { nKey } of parseMailingKeyObjects(sourceMailingKeys)) {
+      all.add(nKey);
+    }
+
+    if (source && !Array.isArray(source)) {
+      for (const nKey of collectMailingFromFlags(source)) {
+        all.add(nKey);
+      }
+    }
+  }
+
+  return [...all]
+    .sort((a, b) => a - b)
+    .map((nKey) => ({
+      nKey,
+      nValue: selected.has(nKey) ? 1 : 0,
+    }));
+};
+
 const collectMailingFromFlags = (...objs: any[]): number[] => {
   const acc = new Set<number>();
   for (const obj of objs) {
@@ -174,14 +237,17 @@ const deriveMailingKeys = (
 ): number[] => {
   // 1) Ce qui vient explicitement du payload
   const fromFieldPayload = parseMailingKey(hsVal(payload, "mailing_key_vary"));
-  const fromVaryObjectsPayload = parseMailingKeyObjects(
+  const mailingKeyObjectsPayload = parseMailingKeyObjects(
     hsVal(payload, "MailingKeys") ?? hsVal(payload, "mailing_key_vary")
-  ).map((x) => x.nKey);
+  );
+  const fromVaryObjectsPayload = extractActiveMailingKeys(
+    mailingKeyObjectsPayload
+  );
   const fromFlagsPayload = collectMailingFromFlags(payload);
 
   const hasExplicitInPayload =
     fromFieldPayload.length > 0 ||
-    fromVaryObjectsPayload.length > 0 ||
+    mailingKeyObjectsPayload.length > 0 ||
     fromFlagsPayload.length > 0;
 
   if (hasExplicitInPayload) {
@@ -199,9 +265,10 @@ const deriveMailingKeys = (
   const fromFieldAssoc = parseMailingKey(
     hsVal(assocCompany, "mailing_key_vary") ?? mailingKeyField
   );
-  const fromVaryObjectsAssoc = parseMailingKeyObjects(
+  const mailingKeyObjectsAssoc = parseMailingKeyObjects(
     hsVal(assocCompany, "MailingKeys") ?? hsVal(assocCompany, "mailing_key_vary")
-  ).map((x) => x.nKey);
+  );
+  const fromVaryObjectsAssoc = extractActiveMailingKeys(mailingKeyObjectsAssoc);
   const fromFlagsAssoc = collectMailingFromFlags(assocCompany);
 
   return [
@@ -268,10 +335,17 @@ function extractVaryCode(result: any): string | undefined {
   return (
     result?.sCustomerCode ||
     result?.customerCode ||
+    result?.CustomerCode ||
+    result?.sCodeClient ||
+    result?.SCodeClient ||
     result?.CODECLIENT ||
     result?.codeclient ||
-    result?.data?.sCustomerCode
-  )?.toString();
+    result?.CodeClient ||
+    result?.codeClient ||
+    result?.data?.sCustomerCode ||
+    result?.data?.customerCode ||
+    result?.data?.CODECLIENT
+  )?.toString().trim();
 }
 
 function extractVaryId(result: any): string | undefined {
@@ -341,6 +415,10 @@ async function updateVaryCustomerByCode(
 async function createVaryCustomer(customerData: object, token: string): Promise<object> {
   const response = await axios.post(VARY_CUSTOMER_URL, customerData, {
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    params: {
+      sCustomerCode: VARY_CREATE_CUSTOMER_CODE,
+      idContact4Log: VARY_CONTACT_ID,
+    },
   });
 
   if (![200, 201].includes(response.status)) {
@@ -369,6 +447,112 @@ async function updateHubSpotCompany(companyId: string, properties: Record<string
     throw new Error(`Erreur update HubSpot company: ${response.status}`);
   }
   return response.data;
+}
+
+async function getVaryCustomersBySIRET(siretNumbers: string[], token: string): Promise<any[]> {
+  const results: any[] = [];
+
+  for (const siret of siretNumbers) {
+    try {
+      const response = await axios.get(VARY_CUSTOMER_URL, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+        },
+        params: {
+          nPageNumber: 1,
+          nPageSize: 50,
+          sSIRET: siret,
+        },
+        validateStatus: () => true,
+      });
+
+      console.log("Vary lookup by SIRET response:", {
+        siret,
+        status: response.status,
+        data: response.data,
+      });
+
+      const customer = response.data?.Customers?.[0];
+
+      if (customer) {
+        results.push(customer);
+      }
+    } catch (error: any) {
+      console.error(
+        `Erreur Vary customer lookup SIRET ${siret}:`,
+        error?.response?.data || error?.message || error
+      );
+    }
+  }
+
+  return results;
+}
+
+async function getVaryCustomersByVAT(vatCodes: string[], token: string): Promise<any[]> {
+  const results: any[] = [];
+
+  for (const vatCode of vatCodes) {
+    try {
+      const response = await axios.get(VARY_CUSTOMER_URL, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+        },
+        params: {
+          nPageNumber: 1,
+          nPageSize: 50,
+          sVatCode: vatCode,
+        },
+        validateStatus: () => true,
+      });
+
+      console.log("Vary lookup by TVA response:", {
+        vatCode,
+        status: response.status,
+        firstCustomer: response.data?.Customers?.[0],
+      });
+
+      const customer = response.data?.Customers?.[0];
+
+      if (customer) {
+        results.push(customer);
+      }
+    } catch (error: any) {
+      console.error(
+        `Erreur Vary customer lookup TVA ${vatCode}:`,
+        error?.response?.data || error?.message || error
+      );
+    }
+  }
+
+  return results;
+}
+
+function resolveVaryId(payload: any, query: any, assocCompany?: any): string | undefined {
+  const pick = (...keys: string[]) => {
+    for (const key of keys) {
+      const v =
+        payload?.[key] ??
+        payload?.properties?.[key]?.value ??
+        assocCompany?.[key] ??
+        assocCompany?.properties?.[key]?.value ??
+        query?.[key];
+
+      if (typeof v === "string" && v.trim()) return v.trim();
+      if (typeof v === "number") return String(v);
+    }
+
+    return undefined;
+  };
+
+  return pick(
+    "idclient_vary",
+    "id_vary",
+    "idCustomer",
+    "id_customer",
+    "customerId"
+  );
 }
 
 /**
@@ -495,29 +679,41 @@ functions.http(
         assocCompany,
         p.mailing_key_vary
       );
+      const siret = normalizeOptionalText(p.siret);
+      const codeTVA = normalizeOptionalText(p.code_tva);
+      const hasParticulierMailing =
+        hasParticulierMailingKeyValue(hsVal(payload, "mailing_key_vary")) ||
+        hasParticulierMailingKeyValue(hsVal(assocCompany, "mailing_key_vary")) ||
+        hasParticulierMailingKeyValue(p.mailing_key_vary);
+      const hasMailingSelection =
+        hasParticulierMailing || mailingKeys.length > 0;
+      const isParticulierCustomer =
+        hasParticulierMailing && !siret && !codeTVA;
 
-      const isFR = countryISO === "FR";
       const missing: string[] = [];
+      const required = ["email_facture"];
+      if (!isParticulierCustomer) required.push("mailing_key_vary");
 
       if (!p.email_facture) missing.push("email_facture");
-      if (mailingKeys.length === 0) missing.push("mailing_key_vary");
-      if (isFR && mailingKeys.length > 0 && !p.siret) missing.push("siret");
+      if (!hasMailingSelection) {
+        missing.push("mailing_key_vary");
+      }
 
       if (missing.length) {
         return res.status(400).json({
           message: "Champs obligatoires manquants",
-          required: [
-            "email_facture",
-            "mailing_key_vary",
-            "siret (FR + mailing key)",
-          ],
+          required,
           missing,
           debug: {
             pays__iso_: countryISO,
-            siret_present: !!p.siret,
+            siret_present: !!siret,
+            code_tva_present: !!codeTVA,
             email_facture_present: !!p.email_facture,
             mailing_keys_count: mailingKeys.length,
             mailing_keys: mailingKeys,
+            mailing_key_present: hasMailingSelection,
+            particulier_mailing_selected: hasParticulierMailing,
+            is_particulier_customer: isParticulierCustomer,
           },
         });
       }
@@ -530,19 +726,96 @@ functions.http(
         return res.status(400).json({ message: "Invalid email_facture" });
       }
 
-      if (!validateSIRET(p.siret, countryISO, mailingKeys)) {
+      if (!isParticulierCustomer && !validateSIRET(siret, countryISO, mailingKeys)) {
         return res.status(400).json({
           message:
             "Invalid or missing SIRET for FR customers with Mailing Key",
         });
       }
 
+      if (isParticulierCustomer) {
+        console.log(
+          "Customer sent as particulier because mailing key internal value is 0 and siret/code_tva are empty",
+          {
+            particulier_mailing_selected: hasParticulierMailing,
+            siret_present: !!siret,
+            code_tva_present: !!codeTVA,
+          }
+        );
+      }
+
       /**
        * 3) Payload Vary V1
        */
-      const siretDigits = p.siret
-        ? p.siret.replace(/\D/g, "")
-        : undefined;
+      const resolvedVaryCode = resolveVaryCode(payload, req.query, assocCompany);
+      const resolvedVaryId = resolveVaryId(payload, req.query, assocCompany);
+
+      // Le mode initial dépend uniquement du code client.
+      // L'id Vary ne suffit pas, car Vary PATCH attend sCustomerCode.
+      const requestedMode: UpsertMode = resolvedVaryCode ? "update" : "create";
+
+      let effectiveMode: UpsertMode = requestedMode;
+      let effectiveVaryCode: string | undefined = resolvedVaryCode;
+
+
+
+      const hubspotCompanyId =
+        payload.companyId ||
+        payload.objectId ||
+        payload.company_id ||
+        payload.hs_object_id ||
+        assocCompany?.id ||
+        assocCompany?.companyId ||
+        assocCompany?.objectId ||
+        hsVal(assocCompany, "hs_object_id");
+
+      console.log("Mode choisi:", requestedMode, "resolvedVaryCode:", resolvedVaryCode);
+      console.log("Step 3.1 - get Vary auth token");
+      const token = await getVaryAuthToken(VARY_USER, VARY_PASSWORD);
+      console.log("Step 3.1 - token reçu");
+
+      const siretDigits = siret
+        ? siret.replace(/\D/g, "")
+        : "";
+      const codeTVAForVary = codeTVA ?? "";
+      let currentVaryCustomer: any = null;
+
+      if (!effectiveVaryCode) {
+        const existingBySiret = siretDigits
+          ? await getVaryCustomersBySIRET([siretDigits], token)
+          : [];
+
+        const existingByVat = existingBySiret.length
+          ? []
+          : await getVaryCustomersByVAT(
+            codeTVAForVary ? [codeTVAForVary] : [],
+            token
+          );
+
+        const existingCustomer = existingBySiret[0] ?? existingByVat[0];
+        const existingCustomerCode = extractVaryCode(existingCustomer);
+
+        if (existingCustomerCode) {
+          effectiveMode = "update";
+          effectiveVaryCode = existingCustomerCode;
+          currentVaryCustomer = existingCustomer;
+
+          console.log("Customer existant trouvé dans Vary", {
+            matchedBy: existingBySiret.length ? "siret" : "vat",
+            effectiveVaryCode,
+            idCustomer: existingCustomer?.idCustomer,
+          });
+        } else if (existingCustomer) {
+          console.error("Customer trouvé mais aucun sCustomerCode récupéré", {
+            existingCustomer,
+          });
+
+          throw new Error(
+            "Customer trouvé par SIRET/TVA mais aucun sCustomerCode récupérable. Refus de PATCH avec id interne."
+          );
+        }
+      }
+
 
       const paymentConditions =
         (p.credit_safe_delai_paiement || "").toString().trim() || undefined;
@@ -564,13 +837,32 @@ functions.http(
           .toString()
           .trim()
           .toUpperCase() || undefined;
-      const mailingKeysFromPayload = parseMailingKeyObjects(
-        hsVal(payload, "MailingKeys") ?? hsVal(payload, "mailing_key_vary")
+      if (requestedMode === "update" && resolvedVaryCode) {
+        try {
+          console.log("Step 3.2 - fetch current Vary customer start", {
+            resolvedVaryCode,
+          });
+          const currentVaryLookup = await getVaryCustomerByCode(
+            String(resolvedVaryCode),
+            token
+          );
+          currentVaryCustomer =
+            currentVaryLookup?.Customers?.[0] ?? currentVaryLookup ?? null;
+          console.log("Step 3.2 - fetch current Vary customer done");
+        } catch (err: any) {
+          console.warn(
+            "Step 3.2 - fetch current Vary customer failed",
+            safeError(err)
+          );
+        }
+      }
+      const mailingKeysForVary = buildMailingKeysForVary(
+        mailingKeys,
+        hsVal(payload, "MailingKeys"),
+        hsVal(assocCompany, "MailingKeys"),
+        currentVaryCustomer
       );
-      const mailingKeysForVary =
-        mailingKeysFromPayload.length > 0
-          ? mailingKeysFromPayload
-          : mailingKeys.map((n) => ({ nKey: n }));
+      console.log("MailingKeys envoyees a Vary:", mailingKeysForVary);
 
       const creditLimitScoreRaw = p.credit_safe_limit_score;
       const parsedCreditLimit = toInt(creditLimitScoreRaw);
@@ -579,39 +871,38 @@ functions.http(
           ? 1250 // fallback par défaut si la valeur HS est absente ou invalide
           : parsedCreditLimit;
 
-
+      const cityKey = effectiveMode === "update" ? "sLocalite" : "sCity";
+      const vatKey = effectiveMode === "update" ? "sCodeTVA" : "sVatCode";
 
       const customerData: Record<string, any> = {
-        //sName: name,
+        sName: name,
         sDescr: description,
-        /*
+        idExternal: hubspotCompanyId ? String(hubspotCompanyId) : undefined,
+
         sCodelang: varyLanguage,
         sCodepost: p.zip,
         sZipCode: p.zip,
         sCodepays: countryISO,
         sAddressLine1: p.address,
         sAddressLine2: p.address2,
-        sCity: p.city,
+        [cityKey]: p.city,
         sSiret: siretDigits,
-        sCodeTVA: p.code_tva,
-        sEmail: p.email_client,
-        sPhone: normalizePhone(p.phone),
-        sGSM: normalizePhone(p.mobilephone || p.phone),
+        [vatKey]: codeTVAForVary,
+        sEmail: p.email_client ?? "",
+        sPhone: normalizePhone(p.phone) ?? "",
+        sGSM: normalizePhone(p.mobilephone || p.phone) ?? "",
         sEmailInvoice: p.email_facture,
-        bParticulier: isTruthy(p.particulier),
-        nPrivatePerson: isTruthy(p.particulier) ? 1 : 0,
+        bParticulier: isParticulierCustomer ? 1 : 0,
+        nPrivatePerson: isParticulierCustomer ? 1 : 0,
         ...(mailingKeysForVary.length
           ? { MailingKeys: mailingKeysForVary }
           : {}),
 
-        // 👉 nouveaux champs demandés par Vary
-        sPaymentConditions: paymentConditions,          // ce que Vary utilise pour la condition de paiement
-        credit_safe_delai_paiement: paymentConditions,  // trace brute de la valeur HubSpot
-        nCreditlimitActive: 1,                          // valeur par défaut
-        nCreditLimitAmount: nCreditLimitAmount,  // 👈 désormais basé sur credit_safe_limit_score
+        sPaymentConditions: paymentConditions,
+        credit_safe_delai_paiement: paymentConditions,
+        nCreditlimitActive: 1,
+        nCreditLimitAmount: nCreditLimitAmount,
         nInvoiceSendMethod: 2,
-        */
-
       };
 
       console.log("Payload envoyé à Vary V1:", customerData);
@@ -619,50 +910,44 @@ functions.http(
       /**
        * 4) Mode update/create
        */
-      const resolvedVaryCode = resolveVaryCode(payload, req.query, assocCompany);
-      const mode: UpsertMode = resolvedVaryCode ? "update" : "create";
-
-      console.log("Mode choisi:", mode, "resolvedVaryCode:", resolvedVaryCode);
-
-      /**
-       * 5) Auth + upsert
-       */
-      console.log("Step 5.1 - get Vary auth token");
-      let token = await getVaryAuthToken(VARY_USER, VARY_PASSWORD);
-      console.log("Step 5.1 - token reçu");
-
       let result: any;
-      if (mode === "update") {
-        // log CURL pour debug support Vary
-        const curlBody = JSON.stringify(customerData).replace(/"/g, '\\"');
-        const safeToken =
-          token.length > 12
-            ? `${token.slice(0, 6)}...${token.slice(-4)}`
-            : "***";
-        const curl = `
-        curl -X PATCH "${VARY_CUSTOMER_URL}/${encodeURIComponent(
-          resolvedVaryCode as string
-        )}?idContact4Log=${VARY_CONTACT_ID}" \\
-          -H "Authorization: Bearer ${safeToken}" \\
-          -H "Content-Type: application/json" \\
-          -d "${curlBody}"
-          `;
-        console.log("===== CURL TO SEND TO VARY SUPPORT =====");
-        console.log(curl);
-        console.log("========================================");
 
-        console.log("Step 5.2 - PATCH customer start");
+      if (effectiveMode === "update") {
+        if (!effectiveVaryCode) {
+          throw new Error("Impossible d'update le customer Vary : aucun sCustomerCode disponible.");
+        }
+
+        if (/^\d+$/.test(effectiveVaryCode)) {
+          throw new Error(
+            `Refus PATCH Vary: effectiveVaryCode="${effectiveVaryCode}" ressemble à un id interne, pas à un sCustomerCode.`
+          );
+        }
+
+        console.log("Step 5.2 - PATCH customer start", {
+          requestedMode,
+          effectiveMode,
+          effectiveVaryCode,
+        });
+
         result = await updateVaryCustomerByCode(
           customerData,
-          resolvedVaryCode as string,
+          effectiveVaryCode,
           token
         );
-        console.log("Step 5.2 - PATCH customer success");
       } else {
-        console.log("Step 5.2 - CREATE customer start");
+        console.log("Step 5.2 - CREATE customer start", {
+          requestedMode,
+          effectiveMode,
+        });
+
         result = await createVaryCustomer(customerData, token);
+
         console.log("Step 5.2 - CREATE customer success");
       }
+      console.log(
+        "Step 5.2 - Vary upsert raw response:",
+        JSON.stringify(result, null, 2)
+      );
 
       /**
        * 6) GET juste après pour vérifier la valeur modifiée
@@ -670,23 +955,22 @@ functions.http(
        *    - on fait un GET par sCustomerCode
        *    - on log + renvoie dans la réponse
        */
-      const codeAfterUpsert =
+      let codeAfterUpsert =
         extractVaryCode(result) ||
         resolvedVaryCode ||
         p.code_client_vary;
 
       let verify: any = null;
       const idFromPayloadOrAssoc =
-        hsVal(payload, "id_vary") || hsVal(assocCompany, "id_vary");
+        hsVal(payload, "idclient_vary") ||
+        hsVal(assocCompany, "idclient_vary") ||
+        hsVal(payload, "id_vary") ||
+        hsVal(assocCompany, "id_vary");
       let id_vary: string | undefined =
         extractVaryId(result) ||
         (idFromPayloadOrAssoc ? String(idFromPayloadOrAssoc) : undefined);
 
-      const verifyAfterUpsertEnabled = isTruthy(
-        process.env.VARY_VERIFY_AFTER_UPSERT
-      );
-
-      if (codeAfterUpsert && !id_vary && verifyAfterUpsertEnabled) {
+      if (codeAfterUpsert) {
         console.log("Step 6 - VerifyAfterUpsert start", {
           codeAfterUpsert,
         });
@@ -697,40 +981,31 @@ functions.http(
         );
 
         const firstCustomer = verify?.Customers?.[0] ?? verify;
-        id_vary = extractVaryId(firstCustomer);
+        id_vary = extractVaryId(firstCustomer) || id_vary;
+        codeAfterUpsert = extractVaryCode(firstCustomer) || codeAfterUpsert;
       } else {
         console.log("Step 6 - VerifyAfterUpsert skipped", {
-          reason: !codeAfterUpsert
-            ? "missing_code"
-            : id_vary
-              ? "id_already_known"
-              : "disabled_by_env",
+          reason: "missing_code",
           codeAfterUpsert,
-          verifyAfterUpsertEnabled,
         });
       }
 
-      // 7) MAJ HubSpot avec code_client_vary / id_vary
-      const candidateCompanyId =
-        payload.companyId ||
-        payload.objectId ||
-        payload.company_id ||
-        payload.hs_object_id ||
-        assocCompany?.id ||
-        assocCompany?.companyId ||
-        assocCompany?.objectId ||
-        hsVal(assocCompany, "hs_object_id");
+      // 7) MAJ HubSpot avec code_client_vary / idclient_vary
+      const candidateCompanyId = hubspotCompanyId;
 
       console.log("HubSpot update - candidateCompanyId:", candidateCompanyId);
       console.log("HubSpot update - codeAfterUpsert:", codeAfterUpsert);
-      console.log("HubSpot update - id_vary:", id_vary);
+      console.log("HubSpot update - idclient_vary:", id_vary);
 
       let hubspotUpdate: any = null;
       let hubspotUpdateError: any = null;
       const currentCodeClientVary =
         hsVal(payload, "code_client_vary") || hsVal(assocCompany, "code_client_vary");
       const currentIdVary =
-        hsVal(payload, "id_vary") || hsVal(assocCompany, "id_vary");
+        hsVal(payload, "idclient_vary") ||
+        hsVal(assocCompany, "idclient_vary") ||
+        hsVal(payload, "id_vary") ||
+        hsVal(assocCompany, "id_vary");
 
       if (candidateCompanyId && (codeAfterUpsert || id_vary)) {
         try {
@@ -739,7 +1014,7 @@ functions.http(
             id_vary &&
             String(currentIdVary || "").trim() !== String(id_vary).trim()
           ) {
-            hsProps.id_vary = String(id_vary);
+            hsProps.idclient_vary = String(id_vary);
           }
           if (
             codeAfterUpsert &&
@@ -771,19 +1046,24 @@ functions.http(
         }
       } else {
         console.warn(
-          "HubSpot update SKIPPED - missing candidateCompanyId or no code/id_vary",
+          "HubSpot update SKIPPED - missing candidateCompanyId or no code/idclient_vary",
           { candidateCompanyId, codeAfterUpsert, id_vary }
         );
       }
 
 
-      return res.status(mode === "update" ? 200 : 201).json({
-        message: mode === "update"
-          ? "Client modifié avec succès"
-          : "Client créé avec succès",
-        vary_customer: result,          // réponse brute du POST/PATCH
-        sent_payload: customerData,     // ce qu’on a envoyé à Vary
-        verify_after_upsert: verify,    // résultat du GET juste après
+      return res.status(effectiveMode === "update" ? 200 : 201).json({
+        message:
+          requestedMode === "create" && effectiveMode === "update"
+            ? "Client existant trouvé dans Vary, modifié au lieu d'être créé"
+            : effectiveMode === "update"
+              ? "Client modifié avec succès"
+              : "Client créé avec succès",
+        requested_mode: requestedMode,
+        effective_mode: effectiveMode,
+        vary_customer: result,
+        sent_payload: customerData,
+        verify_after_upsert: verify,
         hubspot_update: hubspotUpdate,
         hubspot_update_error: hubspotUpdateError,
         hubspot_company_id_used: candidateCompanyId ?? null,

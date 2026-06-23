@@ -44,16 +44,33 @@ const hsVal = (node: any, key: string): any => {
   return undefined;
 };
 
+const normalizeCountryISO2 = (v?: string): string | undefined => {
+  if (!v) return undefined;
+  const code = v.toString().trim().toUpperCase();
+  if (!code) return undefined;
+  if (["FR", "FRA", "FRANCE", "FR_FR"].includes(code)) return "FR";
+  if (code.length === 2) return code;
+  return code.slice(0, 2);
+};
+
 const mapLanguageToVary = (v?: string): string | undefined => {
   if (!v) return undefined;
-  const t = v.toString().trim().toLowerCase();
+
+  const t = v
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, "_");
+
   if (["fr", "f", "fra", "fr_fr"].includes(t)) return "F";
   if (["en", "eng", "en_gb", "en_us"].includes(t)) return "EN";
-  if (["es", "spa"].includes(t)) return "ES";
-  if (["it", "ita"].includes(t)) return "IT";
-  if (["nl", "nld", "dut"].includes(t)) return "NL";
+  if (["es", "spa", "es_es"].includes(t)) return "ES";
+  if (["it", "ita", "it_it"].includes(t)) return "IT";
+  if (["nl", "nld", "dut", "nl_nl"].includes(t)) return "NL";
   if (["pt", "por", "pt_pt", "pt_br"].includes(t)) return "PT";
-  return v.toString().toUpperCase();
+
+  console.warn("Langue HubSpot non mappée vers Vary:", v);
+  return undefined;
 };
 
 const parseTypeDeContact = (v: any): number | undefined => {
@@ -74,13 +91,13 @@ async function getVaryAuthToken(user: string, password: string): Promise<string>
   const headers = { "Content-Type": "application/json" };
 
   // --- DEBUG LOG pour copier/coller dans Postman ---
-  console.log("=== CURL TO REPRODUCE ===");
-  console.log(
-    `curl -X POST '${VARY_API_URL}' \\
-  -H 'Content-Type: application/json' \\
-  -d '${JSON.stringify(requestData)}'`
-  );
-  console.log("=== END CURL ===");
+  // console.log("=== CURL TO REPRODUCE ===");
+  // console.log(
+  //   `curl -X POST '${VARY_API_URL}' \\
+  // -H 'Content-Type: application/json' \\
+  // -d '${JSON.stringify(requestData)}'`
+  // );
+  // console.log("=== END CURL ===");
 
   const response = await axios.post(VARY_API_URL, requestData, { headers });
   if (response.status !== 200 || !response.data?.Token) {
@@ -166,6 +183,104 @@ function parseIdList(input: any): number[] {
 }
 
 
+async function saveVaryIdToHubspot(contactId: string, varyId: string): Promise<void> {
+  if (!contactId || !varyId) return;
+
+  const url = `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`;
+  const body = {
+    properties: {
+      id_contact: varyId,
+    },
+  };
+
+  console.log(url);
+
+  const resp = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${HUBSPOT_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    console.error(`Erreur sauvegarde id_contact HubSpot: ${resp.status} ${await resp.text()}`);
+  } else {
+    console.log(`id_contact sauvegardé dans HubSpot pour contact ${contactId}`);
+  }
+}
+
+async function findVaryContactByEmail(
+  email: string | undefined,
+  token: string
+): Promise<any | null> {
+  const cleanEmail = email?.trim().toLowerCase();
+
+  if (!cleanEmail) {
+    return null;
+  }
+
+  try {
+    const response = await axios.get(
+      `${VARY_CONTACT_URL}?nPageNumber=1&nPageSize=50&sEmail=${encodeURIComponent(cleanEmail)}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+        },
+      }
+    );
+
+    const contacts =
+      response.data?.Contacts ??
+      response.data?.contacts ??
+      response.data?.Contact ??
+      response.data?.items ??
+      response.data?.data ??
+      [];
+
+    const list = Array.isArray(contacts) ? contacts : [contacts];
+
+    const existingContact = list.find((contact: any) => {
+      const varyEmail = (
+        contact?.sEmail ??
+        contact?.EMAIL ??
+        contact?.Email ??
+        contact?.email ??
+        ""
+      )
+        .toString()
+        .trim()
+        .toLowerCase();
+
+      return varyEmail === cleanEmail;
+    });
+
+    return existingContact ?? null;
+  } catch (error: any) {
+    console.error(
+      `Erreur Vary contact lookup email ${cleanEmail}:`,
+      error?.response?.data || error?.message || error
+    );
+
+    return null;
+  }
+}
+
+function extractVaryContactId(contact: any): string | undefined {
+  if (!contact) {
+    return undefined;
+  }
+
+  return (
+    contact?.idContact ??
+    contact?.IDCONTACT ??
+    contact?.id_contact ??
+    contact?.id
+  )?.toString();
+}
+
 
 
 function buildConsentsFromHubSpot(opts: {
@@ -246,7 +361,6 @@ functions.http("hubspotVaryContactProd", async (req: Request, res: Response) => 
     const vary_id = (payload.vary_id ?? req.query?.vary_id ?? hsVal(payload, "id_contact"))?.toString();
     const mode: UpsertMode = vary_id ? "update" : "create";
 
-
     // ---- Read contact fields from HS payload ----
     const firstName = (hsVal(payload, "firstname") || hsVal(payload, "firstName") || payload.firstName || payload.firstname || "").toString().trim();
     const lastName = (hsVal(payload, "lastname") || hsVal(payload, "lastName") || payload.lastName || payload.lastname || "").toString().trim();
@@ -257,8 +371,15 @@ functions.http("hubspotVaryContactProd", async (req: Request, res: Response) => 
     const jobtitle = (hsVal(payload, "jobtitle") || payload.jobtitle || "").toString().trim(); // fonction
     const hsLang = (hsVal(payload, "hs_language") || payload.hs_language || "").toString();
     const varyLang = mapLanguageToVary(hsLang);
-    const typeDeContact = parseTypeDeContact(hsVal(payload, "type_de_contact") ?? payload.type_de_contact);
 
+    console.log("Language mapping:", {
+      hsLang,
+      varyLang,
+    });
+
+
+    const countryCode = normalizeCountryISO2(hsVal(payload, "pays") ?? payload.pays);
+    const typeDeContact = parseTypeDeContact(hsVal(payload, "type_de_contact") ?? payload.type_de_contact);
     const overrideRaw = (hsVal(payload, "contact_bloque") ?? payload.contact_bloque ?? req.query?.contact_bloque);
 
     console.log(hsVal(payload, "contact_bloque"));
@@ -288,8 +409,6 @@ functions.http("hubspotVaryContactProd", async (req: Request, res: Response) => 
     let linksCustomers: any[] = [];
     if (hubspot_id) {
       const tokenTmp = await getVaryAuthToken(VARY_USER, VARY_PASSWORD);
-      //const tokenTmp = "TQBAAGsArCBUAGgAMwBHAHIANABkAEUAfAA3ADIANwA1ADQANAA1ADcAfAAyADAAMgA1ADAANAAwADgAMAA5ADQANQAyADUAOQA5ADgA";
-
       const sirets = await getCompaniesSIRETFromHubSpot(hubspot_id);
       linksCustomers = await getVaryCustomersBySIRET(sirets, tokenTmp);
     }
@@ -312,27 +431,27 @@ functions.http("hubspotVaryContactProd", async (req: Request, res: Response) => 
     // ---- Build Vary contact payload ----
     const contactData: Record<string, any> = {
       // API-friendly keys (observed patterns)
-      sFirstName: firstName || undefined,
-      sLastName: lastName || undefined,
+      sFirstName: firstName || "",
+      sLastName: lastName || "",
       sEmail: email || undefined,
-      sPhone: phone || undefined,
-      sMobile: mobile || undefined,
+      sPhone: phone || "",
+      sMobile: mobile || "",
       sTitle: title || undefined, // civilité
       //sFunct: jobtitle || undefined, // fonction
       //sFunction: jobtitle || undefined, // fonction
       sLanguage: varyLang || undefined,
-
+      sCountryCode: countryCode || undefined,
+      idExternal: hubspot_id ? String(hubspot_id) : undefined,
       // DB-like keys (from client CSV mapping) — keep both to be safe
-      FIRSTNAME: firstName || undefined,
-      LASTNAME: lastName || undefined,
+      FIRSTNAME: firstName || "",
+      LASTNAME: lastName || "",
       EMAIL: email || undefined,
-      TELEPHONE: phone || undefined,
-      GSM: mobile || undefined,
+      TELEPHONE: phone || "",
+      GSM: mobile || "",
       TITLE: title || undefined,
-      FUNCT: jobtitle || undefined,
+      FUNCT: jobtitle || "",
       sCodeLang: varyLang || undefined,
       IDFUNCTCON: typeof typeDeContact === "number" ? typeDeContact : undefined,
-
       // Blocked flags
       bBlocked: isBlocked ? 1 : 0,
 
@@ -349,15 +468,54 @@ functions.http("hubspotVaryContactProd", async (req: Request, res: Response) => 
     // ---- Auth + call Vary ----
     const token = await getVaryAuthToken(VARY_USER, VARY_PASSWORD);
 
-
-    //const token = "TQBAAGsArCBUAGgAMwBHAHIANABkAEUAfAA3ADIANwA1ADQANAA1ADcAfAAyADAAMgA1ADAANAAwADgAMAA5ADQANQAyADUAOQA5ADgA";
-
     console.log("Le token est " + token);
-    const result = mode === "create"
-      ? await createVaryContact(contactData, token)
-      : await updateVaryContact(contactData, vary_id!, token);
+    let result: any;
+    let returnedVaryId: string | undefined = vary_id;
+    let effectiveMode: UpsertMode = mode;
 
-    const returnedVaryId = result?.idContact || vary_id;
+    if (mode === "create" && email) {
+      const existingContact = await findVaryContactByEmail(email, token);
+      const existingContactId = extractVaryContactId(existingContact);
+
+      if (existingContactId) {
+        effectiveMode = "update";
+        returnedVaryId = existingContactId;
+
+        console.log("Contact existant trouvé dans Vary, create transformé en update", {
+          email,
+          existingContactId,
+        });
+      }
+    }
+
+    if (effectiveMode === "create") {
+      console.log("Step - CREATE contact start");
+
+      result = await createVaryContact(contactData, token);
+
+      console.log("Step - CREATE contact success");
+    } else {
+      const contactIdToUpdate = returnedVaryId || vary_id;
+
+      if (!contactIdToUpdate) {
+        throw new Error("Impossible d'update le contact Vary : aucun idContact disponible.");
+      }
+
+      console.log("Step - PATCH contact start", {
+        requestedMode: mode,
+        effectiveMode,
+        contactIdToUpdate,
+      });
+
+      result = await updateVaryContact(contactData, contactIdToUpdate, token);
+
+      console.log("Step - PATCH contact success");
+    }
+
+    returnedVaryId =
+      extractVaryContactId(result) ||
+      returnedVaryId ||
+      vary_id;
 
     if (hubspot_id && returnedVaryId) {
       try {
@@ -367,9 +525,17 @@ functions.http("hubspotVaryContactProd", async (req: Request, res: Response) => 
       }
     }
 
-    return res.status(mode === "create" ? 201 : 200).json({
-      message: mode === "create" ? "Contact créé avec succès" : "Contact modifié avec succès",
+    return res.status(effectiveMode === "update" ? 200 : 201).json({
+      message:
+        mode === "create" && effectiveMode === "update"
+          ? "Contact existant trouvé dans Vary, modifié au lieu d'être créé"
+          : effectiveMode === "update"
+            ? "Contact modifié avec succès"
+            : "Contact créé avec succès",
+      requested_mode: mode,
+      effective_mode: effectiveMode,
       vary_contact: result,
+      vary_id: returnedVaryId,
       sent_payload: contactData,
       cloud_function_egress_ip: await egressIpPromise,
     });
@@ -384,30 +550,3 @@ functions.http("hubspotVaryContactProd", async (req: Request, res: Response) => 
 });
 
 
-async function saveVaryIdToHubspot(contactId: string, varyId: string): Promise<void> {
-  if (!contactId || !varyId) return;
-
-  const url = `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`;
-  const body = {
-    properties: {
-      id_contact: varyId,
-    },
-  };
-
-  console.log(url);
-
-  const resp = await fetch(url, {
-    method: "PATCH",
-    headers: {
-      Authorization: `Bearer ${HUBSPOT_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) {
-    console.error(`Erreur sauvegarde id_contact HubSpot: ${resp.status} ${await resp.text()}`);
-  } else {
-    console.log(`id_contact sauvegardé dans HubSpot pour contact ${contactId}`);
-  }
-}
